@@ -1,0 +1,7 @@
+*.o
+*.so
+src.zip
+tests/snippets/test-*
+!tests/snippets/test-*.c
+tests/snippets/*.out
+.vscode/
