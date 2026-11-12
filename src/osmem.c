@@ -1,173 +1,22 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include <unistd.h>
-#include <sys/mman.h>
 #include <string.h>
 
 #include "osmem.h"
-#include "block_meta.h"
+#include "internal.h"
 
-#define ALIGNMENT		((size_t)8)
-#define ALIGN_UP(x)		(((x) + ALIGNMENT - 1) & ~(ALIGNMENT - 1))
-#define META_SIZE		ALIGN_UP(sizeof(struct block_meta))
-#define MMAP_THRESHOLD		((size_t)(128 * 1024))
-#define CALLOC_THRESHOLD	((size_t)4096)
-#define MIN_SPLIT_SIZE		(META_SIZE + ALIGNMENT)
+#define PUBLIC __attribute__((visibility("default")))
 
-static struct block_meta *heap_list;
-static struct block_meta *mmap_list;
-static int heap_bootstrapped;
+PUBLIC void *os_malloc(size_t size);
+PUBLIC void *os_calloc(size_t nmemb, size_t size);
+PUBLIC void *os_realloc(void *ptr, size_t size);
+PUBLIC void os_free(void *ptr);
 
-static void *block_payload(struct block_meta *b)
-{
-	return (char *)b + META_SIZE;
-}
-
-static struct block_meta *block_from_payload(void *p)
-{
-	return (struct block_meta *)((char *)p - META_SIZE);
-}
-
-static struct block_meta *heap_tail(void)
-{
-	struct block_meta *cur = heap_list;
-
-	if (!cur)
-		return NULL;
-	while (cur->next)
-		cur = cur->next;
-	return cur;
-}
-
-static void heap_push_back(struct block_meta *b)
-{
-	struct block_meta *tail = heap_tail();
-
-	b->next = NULL;
-	if (!tail) {
-		b->prev = NULL;
-		heap_list = b;
-		return;
-	}
-	tail->next = b;
-	b->prev = tail;
-}
-
-static void mmap_track(struct block_meta *b)
-{
-	b->prev = NULL;
-	b->next = mmap_list;
-	if (mmap_list)
-		mmap_list->prev = b;
-	mmap_list = b;
-}
-
-static void mmap_untrack(struct block_meta *b)
-{
-	if (b->prev)
-		b->prev->next = b->next;
-	else
-		mmap_list = b->next;
-	if (b->next)
-		b->next->prev = b->prev;
-}
-
-static void coalesce_free_runs(void)
-{
-	struct block_meta *b = heap_list;
-
-	while (b && b->next) {
-		if (b->status == STATUS_FREE && b->next->status == STATUS_FREE) {
-			b->size += META_SIZE + b->next->size;
-			b->next = b->next->next;
-			if (b->next)
-				b->next->prev = b;
-			continue;
-		}
-		b = b->next;
-	}
-}
-
-static struct block_meta *best_fit(size_t need)
-{
-	struct block_meta *winner = NULL;
-
-	for (struct block_meta *b = heap_list; b; b = b->next) {
-		if (b->status != STATUS_FREE || b->size < need)
-			continue;
-		if (!winner || b->size < winner->size)
-			winner = b;
-	}
-	return winner;
-}
-
-static int try_split(struct block_meta *b, size_t need)
-{
-	if (b->size < need + MIN_SPLIT_SIZE)
-		return 0;
-
-	struct block_meta *tail = (struct block_meta *)((char *)b + META_SIZE + need);
-
-	tail->size = b->size - need - META_SIZE;
-	tail->status = STATUS_FREE;
-	tail->prev = b;
-	tail->next = b->next;
-
-	if (b->next)
-		b->next->prev = tail;
-	b->next = tail;
-	b->size = need;
-	return 1;
-}
-
-static void *acquire_heap(size_t bytes)
-{
-	void *p = sbrk(bytes);
-
-	DIE(p == (void *)-1, "sbrk");
-	return p;
-}
-
-static struct block_meta *acquire_mapping(size_t payload)
-{
-	size_t len = META_SIZE + payload;
-	void *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
-		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
-	DIE(p == MAP_FAILED, "mmap");
-
-	struct block_meta *b = (struct block_meta *)p;
-
-	b->size = payload;
-	b->status = STATUS_MAPPED;
-	return b;
-}
-
-static void release_mapping(struct block_meta *b)
-{
-	int rc = munmap(b, META_SIZE + b->size);
-
-	DIE(rc < 0, "munmap");
-}
-
-static void bootstrap_heap(void)
-{
-	if (heap_bootstrapped)
-		return;
-	heap_bootstrapped = 1;
-
-	struct block_meta *b = acquire_heap(MMAP_THRESHOLD);
-
-	b->size = MMAP_THRESHOLD - META_SIZE;
-	b->status = STATUS_FREE;
-	heap_push_back(b);
-}
-
-static int use_mmap_for(size_t aligned_payload, size_t threshold)
-{
-	return aligned_payload + META_SIZE >= threshold;
-}
-
+/*
+ * Satisfy `need` bytes from the brk-managed heap, growing it only when
+ * best-fit fails. When growth is required, extending a free tail block
+ * is preferred over appending a brand-new one (lab spec).
+ */
 static void *serve_from_heap(size_t need)
 {
 	bootstrap_heap();
@@ -206,6 +55,12 @@ static void *serve_via_mmap(size_t need)
 	return block_payload(b);
 }
 
+/*
+ * Enlarge heap block `b` without moving its payload:
+ *   1. coalesce with following free blocks one-by-one;
+ *   2. if `b` is the last block on the heap, extend via sbrk().
+ * Returns 1 on success, 0 if the block must be relocated.
+ */
 static int try_grow_in_place(struct block_meta *b, size_t need)
 {
 	while (b->size < need && b->next && b->next->status == STATUS_FREE) {
@@ -231,7 +86,7 @@ void *os_malloc(size_t size)
 	if (size == 0)
 		return NULL;
 
-	size_t need = ALIGN_UP(size);
+	size_t need = align_payload(size);
 
 	if (use_mmap_for(need, MMAP_THRESHOLD))
 		return serve_via_mmap(need);
@@ -243,7 +98,7 @@ void *os_calloc(size_t nmemb, size_t size)
 	if (nmemb == 0 || size == 0)
 		return NULL;
 
-	size_t need = ALIGN_UP(nmemb * size);
+	size_t need = align_payload(nmemb * size);
 	void *p;
 
 	if (use_mmap_for(need, CALLOC_THRESHOLD))
@@ -289,7 +144,7 @@ void *os_realloc(void *ptr, size_t size)
 	if (b->status == STATUS_FREE)
 		return NULL;
 
-	size_t need = ALIGN_UP(size);
+	size_t need = align_payload(size);
 
 	if (b->status == STATUS_MAPPED) {
 		void *np = use_mmap_for(need, MMAP_THRESHOLD)
